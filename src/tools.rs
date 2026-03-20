@@ -54,6 +54,14 @@ pub struct ToolRegistry {
     tool_defs: Vec<ToolDef>,
 }
 
+impl Clone for ToolRegistry {
+    fn clone(&self) -> Self {
+        // Note: we can't clone dyn Tool directly, so we recreate the default registry
+        // In production, use a Arc<dyn Tool> for proper cloning
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         let mut registry = Self {

@@ -26,6 +26,9 @@ colored = "2"
 tokio-stream = "0.1"
 futures = "0.3"
 
+# CLI argument parsing (for dual-agent mode)
+clap = { version = "4.5", features = ["derive"] }
+
 [dev-dependencies]
 # Testing
 tokio-test = "0.4"
