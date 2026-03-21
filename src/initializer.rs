@@ -1,15 +1,15 @@
-//! # Initializer Agent — 首个会话初始化
-//!
-//! 负责根据用户需求建立完整的项目脚手架：
-//! 1. 创建 SPEC.md（feature list，JSON 格式）
-//! 2. 创建 init.sh（开发环境启动脚本）
-//! 3. 创建 claude-progress.txt（进度日志）
-//! 4. 初始化 git 仓库并做初始 commit
-//!
-//! 这是 Anthropic 双 Agent 架构的**第一个会话**：
-//! ```
-//! 用户需求 → Initializer Agent → 项目脚手架 → Coding Agent（循环）→ 最终交付
-//! ```
+// # Initializer Agent — 首个会话初始化
+//
+// 负责根据用户需求建立完整的项目脚手架：
+// 1. 创建 SPEC.md（feature list，JSON 格式）
+// 2. 创建 init.sh（开发环境启动脚本）
+// 3. 创建 claude-progress.txt（进度日志）
+// 4. 初始化 git 仓库并做初始 commit
+//
+// 这是 Anthropic 双 Agent 架构的**第一个会话**：
+// ```
+// 用户需求 → Initializer Agent → 项目脚手架 → Coding Agent（循环）→ 最终交付
+// ```
 
 use crate::llm::{LlmClient, LlmResponse, LlmMessage};
 use crate::project::{Feature, FeatureList};

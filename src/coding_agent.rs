@@ -1,24 +1,31 @@
-//! # Coding Agent — 增量式编程 Agent
-//!
-//! 对应 Anthropic 双 Agent 架构的**后续会话**。
-//!
-//! 每次会话的流程：
-//! 1. **Get Bearings**: 读取进度文件 + git log + SPEC.md，快速了解当前状态
-//! 2. **Health Check**: 运行 init.sh，验证基础功能没被破坏
-//! 3. **Pick Feature**: 从 SPEC.md 选一个最高优先级未完成的功能
-//! 4. **Implement**: 实现该功能（可能需要多轮工具调用）
-//! 5. **Test**: 端到端测试验证
-//! 6. **Update**: 标记 passes=true，更新 claude-progress.txt，git commit
-//!
-//! 关键约束：
-//! - **每次只做一个 feature** —— 防止上下文耗尽
-//! - **必须端到端测试** —— 不能仅靠代码审查
-//! - **git commit 交接** —— 下一会话通过 git 历史恢复状态
+/// # Coding Agent — 增量式编程 Agent
+///
+/// 对应 Anthropic 双 Agent 架构的**后续会话**。
+///
+/// 支持两种模式：
+/// - **单 Agent 模式**：自己实现 feature（原始版本）
+/// - **多 Agent 模式**：通过 Orchestrator 协调 Coder + Tester + Reviewer 三方协作
+///
+/// 由 `--multi-agent` 标志切换模式。
+///
+/// ## 每次会话的流程：
+/// 1. **Get Bearings**: 读取进度文件 + git log + SPEC.md，快速了解当前状态
+/// 2. **Health Check**: 运行 init.sh，验证基础功能没被破坏
+/// 3. **Pick Feature**: 从 SPEC.md 选一个最高优先级未完成的功能
+/// 4. **Implement**: 实现该功能（可能需要多轮工具调用）
+/// 5. **Test**: 端到端测试验证
+/// 6. **Update**: 标记 passes=true，更新 claude-progress.txt，git commit
+///
+/// ## 关键约束：
+/// - **每次只做一个 feature** —— 防止上下文耗尽
+/// - **必须端到端测试** —— 不能仅靠代码审查
+/// - **git commit 交接** —— 下一会话通过 git 历史恢复状态
 
 use crate::llm::{LlmClient, LlmResponse, LlmMessage};
 use crate::project::{FeatureList, ProgressLog, ProgressEntry, Feature};
 use crate::tools::ToolRegistry;
 use crate::memory::ConversationMemory;
+use crate::multi_agent::{Orchestrator, SharedState, FeatureOutcome};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -51,6 +58,16 @@ impl CodingAgent {
             spec_path: Path::new(project_path).join("SPEC.md").to_string_lossy().to_string(),
             progress_path: Path::new(project_path).join("claude-progress.txt").to_string_lossy().to_string(),
         }
+    }
+
+    /// 新增：支持 multi-agent 模式的构造函数
+    pub fn new_multi_agent(
+        api_key: String,
+        model: String,
+        tools: ToolRegistry,
+        project_path: &str,
+    ) -> Self {
+        Self::new(api_key, model, tools, project_path)
     }
 
     /// 运行 Coding Agent — 主循环
@@ -317,6 +334,86 @@ impl CodingAgent {
     /// 清除记忆（单次会话模式）
     pub fn clear_memory(&mut self) {
         self.memory.clear();
+    }
+
+    // ─────────────────────────────────────────────
+    // 多 Agent 模式（Orchestrator 协调）
+    // ─────────────────────────────────────────────
+
+    /// 运行 Coding Agent（多 Agent 模式）
+    ///
+    /// 使用 Orchestrator 协调 Coder + Tester + Reviewer 三方协作，
+    /// 比单 Agent 模式质量更高，但 token 消耗更大。
+    pub async fn run_multi_agent(&mut self) -> Result<String, CodingError> {
+        println!("\n🔧 Coding Agent: 多 Agent 模式启动");
+        println!("  👨‍💻 Coder → 🧪 Tester → 🔍 Reviewer\n");
+
+        // Step 1: Get Bearings
+        let (features, _progress) = self.get_bearings()?;
+
+        // Step 2: Pick next feature
+        let (feature_idx, feature) = match features.next_pending_feature() {
+            Some((idx, f)) => (idx, f.clone()),
+            None => {
+                return Ok("🎉 所有功能已完成！项目交付。".to_string());
+            }
+        };
+
+        println!("\n📌 Feature #{}: {}", feature_idx, feature.description);
+
+        // Step 3: Run Orchestrator
+        let orchestrator = Orchestrator::new(
+            self.llm.api_key().to_string(),
+            self.llm.model().to_string(),
+            &self.project_path,
+        );
+
+        let outcome: FeatureOutcome = orchestrator
+            .execute_feature(
+                self.llm.api_key().to_string(),
+                self.llm.model().to_string(),
+                feature_idx,
+                feature.clone(),
+            )
+            .await
+            .map_err(|e| CodingError::LlmError(e.to_string()))?;
+
+        // Step 4: Update state
+        let shared = SharedState::new(&self.project_path);
+
+        if outcome.all_passed {
+            shared.mark_feature_done(feature_idx)
+                .map_err(|e| CodingError::SpecSaveFailed(e))?;
+
+            let entry = ProgressEntry::new(
+                feature_idx,
+                &feature.description,
+                "多 Agent 协作完成（Coder + Tester + Reviewer）",
+                &outcome.summary,
+                vec![],
+            );
+            shared.log_progress(entry)
+                .map_err(|e| CodingError::ProgressSaveFailed(e))?;
+
+            shared.git_commit(feature_idx, &feature.description)
+                .map_err(|e| CodingError::GitError(e))?;
+        }
+
+        // Step 5: Summary
+        let features = FeatureList::load_from_file(Path::new(&self.spec_path))
+            .map_err(|e| CodingError::SpecLoadFailed(e))?;
+        let remaining = features.total_features - features.completed_features;
+
+        Ok(format!(
+            "Feature #{}: {}\n{}\n进度: {}/{} ({:.0}%)\n剩余: {} 个功能",
+            feature_idx,
+            if outcome.all_passed { "✅ 完成" } else { "⚠️ 未完全通过" },
+            outcome.summary,
+            features.completed_features,
+            features.total_features,
+            features.progress_percent(),
+            remaining
+        ))
     }
 }
 

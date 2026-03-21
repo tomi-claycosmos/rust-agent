@@ -15,6 +15,7 @@ mod memory;
 mod project;
 mod initializer;
 mod coding_agent;
+mod multi_agent;
 
 use std::io::{self, Write as IoWrite};
 use colored::Colorize;
@@ -157,6 +158,7 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
         "continue" => {
             let mut project_path: Option<PathBuf> = None;
             let mut max = usize::MAX;
+            let mut multi_agent = false;
 
             let mut i = 2;
             while i < args.len() {
@@ -169,6 +171,10 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
                         max = args[i + 1].parse().unwrap_or(usize::MAX);
                         i += 2;
                     }
+                    "--multi-agent" => {
+                        multi_agent = true;
+                        i += 1;
+                    }
                     _ => i += 1,
                 }
             }
@@ -176,7 +182,12 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
             let project_path = project_path.ok_or("缺少 --project 参数")?;
             let project_str = project_path.to_string_lossy().to_string();
 
-            println!("{}", "\n🔧 双 Agent 模式: Coding Agent".cyan());
+            if multi_agent {
+                println!("{}", "\n🔧 双 Agent 模式: Coding Agent (多 Agent)".cyan());
+                println!("  模式: Orchestrator → Coder + Tester + Reviewer");
+            } else {
+                println!("{}", "\n🔧 双 Agent 模式: Coding Agent (单 Agent)".cyan());
+            }
             println!("  项目: {:?}", project_path);
 
             let mut completed = 0;
@@ -193,10 +204,16 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
                     &project_str,
                 );
 
-                match coding_agent.run().await {
+                let result = if multi_agent {
+                    coding_agent.run_multi_agent().await
+                } else {
+                    coding_agent.run().await
+                };
+
+                match result {
                     Ok(report) => {
                         println!("\n{}", format!("✅ {}", report).green());
-                        if report.contains("所有功能已完成") || report.contains("完成") && completed > 0 {
+                        if report.contains("所有功能已完成") || (report.contains("完成") && completed > 0) {
                             break;
                         }
                         completed += 1;
@@ -209,7 +226,8 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
             }
 
             if completed > 0 {
-                println!("\n📊 本轮完成 {} 个 features。", completed);
+                println!("\n📊 本轮完成 {} 个 features（模式: {}）。", completed,
+                    if multi_agent { "多 Agent" } else { "单 Agent" });
                 println!("💡 再次运行 `cargo run -- continue --project {:?}` 继续。", project_path);
             }
         }

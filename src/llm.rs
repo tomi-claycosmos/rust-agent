@@ -103,6 +103,9 @@ impl LlmClient {
         }
     }
 
+    pub fn api_key(&self) -> &str { &self.api_key }
+    pub fn model(&self) -> &str { &self.model }
+
     /// 发送对话请求到 LLM
     pub async fn chat(&self, messages: &[LlmMessage], tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
         // 自动检测使用哪个 API（按模型名判断）

@@ -1,10 +1,10 @@
-//! # Project Scaffolding — 长运行项目的文件结构定义
-//!
-//! 参考 Anthropic 的双 Agent 架构，长运行项目需要以下文件：
-//! - SPEC.md: 结构化 feature list（JSON格式）
-//! - claude-progress.txt: 进度日志
-//! - init.sh: 开发环境启动脚本
-//! - git: 版本历史记录
+// # Project Scaffolding — 长运行项目的文件结构定义
+//
+// 参考 Anthropic 的双 Agent 架构，长运行项目需要以下文件：
+// - SPEC.md: 结构化 feature list（JSON格式）
+// - claude-progress.txt: 进度日志
+// - init.sh: 开发环境启动脚本
+// - git: 版本历史记录
 
 use serde::{Deserialize, Serialize};
 use std::fs;
