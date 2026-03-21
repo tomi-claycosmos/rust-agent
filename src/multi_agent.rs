@@ -338,7 +338,7 @@ impl Orchestrator {
             .join(", "));
 
         let mut outcomes = Vec::new();
-        let mut current_feature = feature.clone();
+        let current_feature = feature.clone();
 
         // 串行执行每个参与 Agent
         for role in &participants {

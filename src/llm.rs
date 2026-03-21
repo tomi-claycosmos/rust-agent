@@ -106,18 +106,28 @@ impl LlmClient {
     pub fn api_key(&self) -> &str { &self.api_key }
     pub fn model(&self) -> &str { &self.model }
 
-    /// 发送对话请求到 LLM
-    pub async fn chat(&self, messages: &[LlmMessage], tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
+    /// 发送对话请求到 LLM（无 thinking 模式）
+    pub async fn chat(&self, messages: &Vec<LlmMessage>, tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
+        self.chat_with_thinking(messages, tools, false).await
+    }
+
+    /// 发送对话请求到 LLM（支持 Extended Thinking）
+    ///
+    /// Anthropic 发现：让 LLM 显式输出推理过程，能显著提升指令遵循质量。
+    /// 适合场景：复杂推理任务、需要规划的多步骤工作。
+    ///
+    /// 对性能的影响：开启后 token 消耗会增加 ~30-50%，但任务成功率显著提升。
+    pub async fn chat_with_thinking(&self, messages: &Vec<LlmMessage>, tools: &[ToolDef], thinking: bool) -> Result<LlmResponse, LlmError> {
         // 自动检测使用哪个 API（按模型名判断）
         if self.model.contains("claude") || self.model.contains("anthropic") {
-            self.chat_anthropic(messages, tools).await
+            self.chat_anthropic(messages, tools, thinking).await
         } else {
             self.chat_openai(messages, tools).await
         }
     }
 
     /// OpenAI Chat Completions API
-    async fn chat_openai(&self, messages: &[LlmMessage], tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
+    async fn chat_openai(&self, messages: &Vec<LlmMessage>, tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
         #[derive(Serialize)]
         struct Request<'a> {
             model: &'a str,
@@ -171,7 +181,7 @@ impl LlmClient {
     }
 
     /// Anthropic Messages API
-    async fn chat_anthropic(&self, messages: &[LlmMessage], tools: &[ToolDef]) -> Result<LlmResponse, LlmError> {
+    async fn chat_anthropic(&self, messages: &Vec<LlmMessage>, tools: &[ToolDef], thinking: bool) -> Result<LlmResponse, LlmError> {
         // Anthropic API 把 system 单独拿出来
         let system_msg = messages.iter().find(|m| m.role == "system");
         let chat_msgs: Vec<&LlmMessage> = messages.iter().filter(|m| m.role != "system").collect();
@@ -184,14 +194,34 @@ impl LlmClient {
             tools: Vec<Value>,
             #[serde(rename = "max_tokens")]
             max_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thinking: Option<AnthropicThinking>,
         }
+
+        #[derive(Serialize)]
+        struct AnthropicThinking {
+            #[serde(rename = "type")]
+            type_: String,
+            budget_tokens: u32,
+        }
+
+        // Anthropic Extended Thinking: 开启时提供额外的思考预算
+        let anthropic_thinking = if thinking {
+            Some(AnthropicThinking {
+                type_: "extended".to_string(),
+                budget_tokens: 8000, // 8k token 思考预算
+            })
+        } else {
+            None
+        };
 
         let req_body = serde_json::json!({
             "model": self.model,
             "messages": chat_msgs,
             "system": system_msg.map(|m| m.content.as_str()),
             "tools": tools,
-            "max_tokens": 4096,
+            "max_tokens": if thinking { 8192 } else { 4096 },
+            "thinking": anthropic_thinking,
         });
 
         let resp = self.http
@@ -296,7 +326,7 @@ impl From<&ToolDef> for Value {
             "function": {
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.parameters,
+                "parameters": t.input_schema,
             }
         })
     }

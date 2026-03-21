@@ -36,7 +36,7 @@
 //!
 //! 这个循环叫做 **ReAct**: Reason + Act
 
-use crate::llm::{LlmClient, LlmResponse, LlmMessage, ToolCall};
+use crate::llm::{LlmClient, LlmResponse};
 use crate::tools::ToolRegistry;
 use crate::memory::ConversationMemory;
 
@@ -66,12 +66,24 @@ impl Agent {
         // Step 1: 把用户输入加入记忆
         self.memory.add_user_message(user_input);
 
+        // 打印当前 token 预算状态
+        self.memory.print_budget_status();
+
         // Agent Loop: 最多循环 MAX_ITERATIONS 次
         for iteration in 0..MAX_ITERATIONS {
             println!("{}", format!("\n  🔄 迭代 {}/{}", iteration + 1, MAX_ITERATIONS));
 
             // Step 2: THINK — 让 LLM 决定下一步
-            let llm_response = self.llm.chat(&self.memory.get_messages(), &self.tools.list()).await?;
+            // 自动使用 Extended Thinking（Anthropic 建议：复杂任务开启）
+            let use_thinking = iteration > 2; // 超过 2 轮后开启 thinking
+            let llm_response = self.llm.chat_with_thinking(
+                &self.memory.get_messages(),
+                &self.tools.list(),
+                use_thinking,
+            ).await?;
+
+            // 再次打印 token 预算（工具调用后）
+            self.memory.print_budget_status();
 
             // Step 3: 检查 LLM 返回的内容
             match llm_response {
@@ -145,11 +157,5 @@ impl std::error::Error for AgentError {}
 impl From<crate::llm::LlmError> for AgentError {
     fn from(e: crate::llm::LlmError) -> Self {
         Self::LlmError(e.0)
-    }
-}
-
-impl From<crate::tools::ToolError> for AgentError {
-    fn from(e: crate::tools::ToolError) -> Self {
-        Self::ToolError(e.0)
     }
 }

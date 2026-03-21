@@ -21,12 +21,11 @@
 /// - **必须端到端测试** —— 不能仅靠代码审查
 /// - **git commit 交接** —— 下一会话通过 git 历史恢复状态
 
-use crate::llm::{LlmClient, LlmResponse, LlmMessage};
+use crate::llm::{LlmClient, LlmResponse};
 use crate::project::{FeatureList, ProgressLog, ProgressEntry, Feature};
 use crate::tools::ToolRegistry;
 use crate::memory::ConversationMemory;
 use crate::multi_agent::{Orchestrator, SharedState, FeatureOutcome};
-use std::fs;
 use std::path::Path;
 use std::process::Command;
 

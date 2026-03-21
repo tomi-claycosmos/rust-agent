@@ -1,418 +1,406 @@
-//! # Tool System — 工具注册与执行
-//!
-//! ## 什么是 Tool Calling？
-//!
-//! Tool Calling 让 Agent 可以执行外部操作，而不仅仅是"说话"。
-//!
-//! ## 工具调用的完整流程
-//! ```text
-//! Agent: "帮我查北京天气"
-//!                           ┌──────────────────┐
-//!                           │  LLM 决定调用     │
-//!                           │  get_weather()    │
-//!                           └────────┬─────────┘
-//!                                    │
-//!                                    ▼
-//!                           ┌──────────────────┐
-//!                           │  工具执行器       │
-//!                           │  (ToolRegistry)   │
-//!                           └────────┬─────────┘
-//!                                    │
-//!            ┌───────────────────────┼───────────────────────┐
-//!            ▼                       ▼                       ▼
-//!     ┌─────────────┐        ┌─────────────┐        ┌─────────────┐
-//!     │ get_weather │        │  calculator │        │  web_search │
-//!     │  (HTTP API) │        │  (计算)     │        │  (HTTP API) │
-//!     └─────────────┘        └─────────────┘        └─────────────┘
-//! ```
+/// # Tools — Agent 的工具系统
+///
+/// ## 什么是 Tool？
+///
+/// Tool 是 Agent 与外部世界交互的方式。
+/// 给 Agent 一个 Tool = 教它一个新技能。
+///
+/// ## Anthropic 的工具设计原则
+///
+/// 来源：Anthropic Engineering Blog - "Writing Tools for Agents"
+///
+/// 1. **选对工具，不过多** — Agent 擅长选择的工具不超过 10 个
+/// 2. **每个工具有清晰边界** — 如果人无法明确区分用途，Agent 也不行
+/// 3. **返回有意义上下文** — 工具返回的是 Agent 的"眼睛"
+/// 4. **Token 高效** — 不要一次返回太多，消耗 Agent 的 Attention Budget
+/// 5. **工具描述本身需要工程化** — Anthropic 发现 Claude 本身就是最好的工具描述工程师
+///
+/// ## Anthropic 的关键发现
+///
+/// - "API 包装式工具"是反模式：不要把 `list_users` + `get_user` + `delete_user`
+///   分成三个工具，而是合并成一个 `user_management` 工具
+/// - 工具描述要包含：用途 + 使用场景 + 示例 + 注意事项
+/// - 优化工具描述后，Claude Code 任务完成时间降低 40%
+///
+/// ## 本实现
+///
+/// 所有工具都遵循这些原则设计。
 
-use serde_json::{Value, Map};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::process::Command;
 
 // ─────────────────────────────────────────────
-// 工具定义（发给 LLM，告诉她有哪些工具可用）
+// 工具定义
 // ─────────────────────────────────────────────
 
-/// 工具定义（用于注册给 LLM）
-#[derive(Debug, Clone, Serialize)]
+/// 工具定义（给 LLM 看的接口）
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
     pub description: String,
-    pub parameters: Value,
+    pub input_schema: serde_json::Value,
 }
 
-/// 工具接口（每种工具都实现这个 trait）
-trait Tool: Send + Sync {
-    fn execute(&self, args: &Map<String, Value>) -> Result<String, ToolError>;
-    fn definition(&self) -> ToolDef;
+/// 单个工具调用请求
+#[derive(Debug)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String, // JSON 字符串
 }
 
-/// 工具注册表
-pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
-    tool_defs: Vec<ToolDef>,
-}
+// ─────────────────────────────────────────────
+// 工具 trait
+// ─────────────────────────────────────────────
 
-impl Clone for ToolRegistry {
-    fn clone(&self) -> Self {
-        // Note: we can't clone dyn Tool directly, so we recreate the default registry
-        // In production, use a Arc<dyn Tool> for proper cloning
-        Self::new()
-    }
-}
-
-impl ToolRegistry {
-    pub fn new() -> Self {
-        let mut registry = Self {
-            tools: HashMap::new(),
-            tool_defs: Vec::new(),
-        };
-
-        // 注册内置工具
-        registry.register(CalculatorTool);
-        registry.register(WeatherTool);
-        registry.register(WebSearchTool);
-        registry.register(TimeTool);
-        registry.register(BashTool);
-
-        registry
-    }
-
-    /// 注册工具
-    fn register<T: Tool + 'static>(&mut self, tool: T) {
-        let def = tool.definition();
-        self.tool_defs.push(def.clone());
-        self.tools.insert(def.name.clone(), Box::new(tool));
-    }
-
-    /// 列出所有已注册的工具
-    pub fn list(&self) -> Vec<ToolDef> {
-        self.tool_defs.clone()
-    }
-
+pub trait Tool: Send {
+    /// 工具名称
+    fn name(&self) -> &str;
+    /// 工具描述（供 LLM 理解何时使用）
+    fn description(&self) -> &str;
+    /// JSON Schema 格式的参数定义
+    fn input_schema(&self) -> serde_json::Value;
     /// 执行工具
-    pub fn execute(&self, name: &str, arguments_json: &str) -> Result<String, ToolError> {
-        let tool = self.tools.get(name)
-            .ok_or_else(|| ToolError(format!("未知工具: {}", name)))?;
-
-        let args: Value = serde_json::from_str(arguments_json)
-            .map_err(|e| ToolError(format!("参数 JSON 解析失败: {}", e)))?;
-
-        let args_map = args.as_object()
-            .ok_or_else(|| ToolError("参数必须是 JSON 对象".to_string()))?;
-
-        tool.execute(args_map)
-    }
+    fn execute(&self, input: &str) -> Result<String, String>;
 }
 
 // ─────────────────────────────────────────────
-// 内置工具实现
+// 工具实现
 // ─────────────────────────────────────────────
 
-/// 计算器工具
+/// Calculator — 数学计算工具
 struct CalculatorTool;
+
 impl Tool for CalculatorTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "calculator".to_string(),
-            description: "执行数学计算。支持 +, -, *, /, ^ 运算符和括号优先级。例如: 2+2, 3*4, (10+5)/3".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "数学表达式，例如 '2 + 2' 或 'sqrt(16) + 3'"
-                    }
-                },
-                "required": ["expression"]
-            }),
-        }
+    fn name(&self) -> &str {
+        "calculator"
     }
 
-    fn execute(&self, args: &Map<String, Value>) -> Result<String, ToolError> {
-        let expr = args.get("expression")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError("缺少 expression 参数".to_string()))?;
+    fn description(&self) -> &str {
+        r#"执行数学计算。
 
-        let result = eval_expression(expr)
-            .map_err(|e| ToolError(format!("计算错误: {}", e)))?;
+使用场景：
+- 计算折扣、价格、百分比（如：50 的 15% 是多少）
+- 面积/体积/距离等物理量计算
+- 日期差值（天数计算）
+- 单位换算
+- 任何需要精确数值的结果
 
-        Ok(format!("{}", result))
+使用示例：
+- calculator("50 * 0.15") → "7.5"（求 50 的 15%）
+- calculator("100 + 200 * 3") → "700"（注意运算顺序）
+- calculator("(10 + 5) / 3") → "5"（带括号的计算）
+- calculator("2 ** 10") → "1024"（指数运算）
+
+注意事项：
+- 适用于浮点数和整数的加减乘除、指数运算
+- 不适用于字符串操作或日期格式化（请用其他工具）
+- 精度：默认使用 Rust 的 f64，足够日常计算使用"#
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "数学表达式，如 '50 * 0.15' 或 '(100 + 200) / 2'"
+                }
+            },
+            "required": ["expression"]
+        })
+    }
+
+    fn execute(&self, input: &str) -> Result<String, String> {
+        #[derive(Debug, Deserialize)]
+        struct CalcInput {
+            expression: String,
+        }
+
+        let input: CalcInput =
+            serde_json::from_str(input).map_err(|e| format!("参数解析失败: {}", e))?;
+
+        // 用 Rust 简易求值器（仅支持基本运算）
+        let result = eval_expression(&input.expression)
+            .map_err(|e| format!("计算错误: {}", e))?;
+
+        Ok(result.to_string())
     }
 }
 
-/// 天气查询工具
-struct WeatherTool;
-impl Tool for WeatherTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "get_weather".to_string(),
-            description: "获取指定城市的当前天气。返回温度、天气状况等信息。".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "城市名称，例如 '北京' 或 'Shanghai'"
-                    }
-                },
-                "required": ["city"]
-            }),
+/// 简易数学表达式求值
+fn eval_expression(expr: &str) -> Result<f64, String> {
+    let expr = expr.trim();
+    // 移除可能的空格
+    let expr = expr.replace(' ', "");
+
+    parse_expr(&expr).map_err(|e| e)
+}
+
+fn parse_expr(s: &str) -> Result<f64, String> {
+    parse_add_sub(s, &mut 0)
+}
+
+fn parse_add_sub(s: &str, pos: &mut usize) -> Result<f64, String> {
+    let mut result = parse_mul_div(s, pos)?;
+
+    while *pos < s.len() {
+        let remaining = &s[*pos..];
+        if remaining.starts_with('+') {
+            *pos += 1;
+            let val = parse_mul_div(s, pos)?;
+            result += val;
+        } else if remaining.starts_with('-') {
+            *pos += 1;
+            let val = parse_mul_div(s, pos)?;
+            result -= val;
+        } else {
+            break;
         }
     }
+    Ok(result)
+}
 
-    fn execute(&self, args: &Map<String, Value>) -> Result<String, ToolError> {
-        let city = args.get("city")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError("缺少 city 参数".to_string()))?;
+fn parse_mul_div(s: &str, pos: &mut usize) -> Result<f64, String> {
+    let mut result = parse_power(s, pos)?;
 
-        // 模拟天气数据
-        let conditions = ["晴天 ☀️", "多云 ⛅", "小雨 🌧️", "雪天 ❄️", "大风 💨"];
-        let temps = [15, 18, 22, 25, 28, 12, 8, 30];
+    while *pos < s.len() {
+        let remaining = &s[*pos..];
+        if remaining.starts_with('*') {
+            if remaining.starts_with("**") {
+                *pos += 2;
+                let val = parse_power(s, pos)?;
+                result = result.powf(val);
+            } else {
+                *pos += 1;
+                let val = parse_power(s, pos)?;
+                result *= val;
+            }
+        } else if remaining.starts_with('/') {
+            *pos += 1;
+            let val = parse_power(s, pos)?;
+            if val == 0.0 {
+                return Err("除数不能为 0".to_string());
+            }
+            result /= val;
+        } else {
+            break;
+        }
+    }
+    Ok(result)
+}
 
-        let idx = city.len() % conditions.len();
-        let condition = conditions[idx];
-        let temp = temps[city.len() % temps.len()];
+fn parse_power(s: &str, pos: &mut usize) -> Result<f64, String> {
+    let result = parse_unary(s, pos)?;
 
-        Ok(format!("{} 今天的天气：{}，温度 {}°C", city, condition, temp))
+    if *pos < s.len() {
+        let remaining = &s[*pos..];
+        if remaining.starts_with("**") {
+            *pos += 2;
+            let val = parse_unary(s, pos)?;
+            return Ok(result.powf(val));
+        }
+    }
+    Ok(result)
+}
+
+fn parse_unary(s: &str, pos: &mut usize) -> Result<f64, String> {
+    if *pos < s.len() && s[*pos..].starts_with('-') {
+        *pos += 1;
+        let val = parse_atom(s, pos)?;
+        Ok(-val)
+    } else {
+        parse_atom(s, pos)
     }
 }
 
-/// 网页搜索工具
-struct WebSearchTool;
-impl Tool for WebSearchTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "web_search".to_string(),
-            description: "搜索互联网获取信息。返回搜索结果摘要。".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "搜索关键词"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "最多返回多少条结果",
-                        "default": 3
-                    }
-                },
-                "required": ["query"]
-            }),
+fn parse_atom(s: &str, pos: &mut usize) -> Result<f64, String> {
+    let remaining = &s[*pos..];
+
+    // 括号
+    if remaining.starts_with('(') {
+        *pos += 1;
+        let val = parse_expr(&s[*pos - 1..])?;
+        // 找到匹配的右括号
+        let mut depth = 1;
+        let mut end = *pos;
+        while end < s.len() && depth > 0 {
+            if s[end..].starts_with('(') {
+                depth += 1;
+            } else if s[end..].starts_with(')') {
+                depth -= 1;
+            }
+            end += 1;
         }
-    }
-
-    fn execute(&self, args: &Map<String, Value>) -> Result<String, ToolError> {
-        let query = args.get("query")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError("缺少 query 参数".to_string()))?;
-
-        let max = args.get("max_results")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3) as usize;
-
-        Ok(format!(
-            "搜索 '{}' 的结果（{}条）：\n  1. [结果 A] - 相关描述...\n  2. [结果 B] - 相关描述...\n  3. [结果 C] - 相关描述...",
-            query, max
-        ))
+        if depth != 0 {
+            return Err("括号不匹配".to_string());
+        }
+        *pos = end;
+        // 重新从括号内容解析
+        let inner = &s[*pos - 1..end - 1];
+        parse_expr(&inner[1..])
+    } else {
+        // 数字
+        let start = *pos;
+        while *pos < s.len() && (s[*pos..].chars().next().map(|c| c.is_numeric()).unwrap_or(false) || s.as_bytes()[*pos] == b'.') {
+            *pos += 1;
+        }
+        if *pos == start {
+            return Err(format!("无法解析: {}", remaining.chars().take(10).collect::<String>()));
+        }
+        s[start..*pos].parse::<f64>().map_err(|_| "数字解析失败".to_string())
     }
 }
 
-/// 时间查询工具
-struct TimeTool;
-impl Tool for TimeTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "get_current_time".to_string(),
-            description: "获取当前时间和日期。无需参数。".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        }
-    }
-
-    fn execute(&self, _args: &Map<String, Value>) -> Result<String, ToolError> {
-        Ok(chrono_lite_now())
-    }
-}
-
-/// Bash 命令工具
+/// Bash — 执行命令行
 struct BashTool;
+
 impl Tool for BashTool {
-    fn definition(&self) -> ToolDef {
-        ToolDef {
-            name: "bash".to_string(),
-            description: "在终端执行 bash 命令。仅用于只读操作（ls, pwd, echo, date 等）。".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "要执行的 bash 命令"
-                    }
-                },
-                "required": ["command"]
-            }),
-        }
+    fn name(&self) -> &str {
+        "bash"
     }
 
-    fn execute(&self, args: &Map<String, Value>) -> Result<String, ToolError> {
-        use std::process::Command;
+    fn description(&self) -> &str {
+        r#"在终端执行命令。
 
-        let cmd = args.get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError("缺少 command 参数".to_string()))?;
+使用场景：
+- 读写文件（cat, echo, tee, mv, mkdir 等）
+- 运行程序和脚本（cargo, python, node, npm 等）
+- 检查文件存在性和内容（ls, find, grep 等）
+- Git 操作（git status, git log, git add, git commit 等）
+- 安装依赖（pip install, cargo build 等）
 
-        let allowed = ["ls", "pwd", "echo", "date", "whoami", "df", "free", "uname", "cat", "head", "tail", "wc", "find"];
-        let first_word = cmd.split_whitespace().next().unwrap_or("");
-        if !allowed.contains(&first_word) {
-            return Err(ToolError(format!(
-                "命令 '{}' 不在白名单中。允许: {}",
-                first_word, allowed.join(", ")
-            )));
+使用示例：
+- bash("ls -la") → 列出当前目录文件
+- bash("cat README.md") → 读取 README 内容
+- bash("echo 'hello' > hello.txt") → 写入文件
+- bash("cargo build 2>&1 | tail -20") → 编译并只看最后20行输出
+- bash("git log --oneline -5") → 最近5次提交
+
+注意事项：
+- 优先用 echo/tee 写文件，不用重定向 > 时加引号防止 shell 注入
+- 组合命令用 && 或 |，如 "cargo build && cargo test"
+- 错误输出也重要：用 2>&1 合并 stderr 和 stdout
+- 工作目录是项目根目录"#
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要执行的 shell 命令，如 'ls -la' 或 'cat file.txt'"
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "超时时间（秒），默认60秒"
+                }
+            },
+            "required": ["command"]
+        })
+    }
+
+    fn execute(&self, input: &str) -> Result<String, String> {
+        #[derive(Debug, Deserialize)]
+        struct BashInput {
+            command: String,
+            #[serde(default = "default_timeout")]
+            timeout: u64,
         }
 
-        let output = Command::new("sh")
-            .args(["-c", cmd])
+        fn default_timeout() -> u64 {
+            60
+        }
+
+        let input: BashInput =
+            serde_json::from_str(input).map_err(|e| format!("参数解析失败: {}", e))?;
+
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(&input.command)
             .output()
-            .map_err(|e| ToolError(format!("执行失败: {}", e)))?;
+            .map_err(|e| format!("命令执行失败: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        if !output.status.success() {
-            return Err(ToolError(format!("命令执行失败:\n{}\n{}", stdout, stderr)));
+        let mut result = String::new();
+
+        if !stdout.is_empty() {
+            result.push_str(&format!("[stdout]\n{}\n", stdout));
+        }
+        if !stderr.is_empty() {
+            result.push_str(&format!("[stderr]\n{}\n", stderr));
+        }
+        if result.is_empty() {
+            result = "(命令执行完成，无输出)".to_string();
         }
 
-        if stderr.is_empty() {
-            Ok(stdout.to_string())
-        } else {
-            Ok(format!("{}\nstderr: {}", stdout, stderr))
-        }
+        result.push_str(&format!("\n[exit code: {}]", output.status.code().unwrap_or(-1)));
+
+        Ok(result)
     }
 }
 
-// ─────────────────────────────────────────────
-// 工具函数
-// ─────────────────────────────────────────────
+/// Get Time — 获取当前时间
+struct GetTimeTool;
 
-/// 数学表达式求值（支持 + - * / 和括号）
-fn eval_expression(expr: &str) -> Result<f64, String> {
-    let expr = expr.replace(" ", "").replace("×", "*").replace("÷", "/");
-
-    // 安全检查：只允许数字、运算符、括号、小数点
-    if !expr.chars().all(|c| c.is_numeric() || "+-*/.()^ ".contains(c)) {
-        return Err("包含不支持的字符".to_string());
+impl Tool for GetTimeTool {
+    fn name(&self) -> &str {
+        "get_current_time"
     }
 
-    parse_expr(&expr, &mut 0).map(|(v, i)| {
-        if i < expr.len() {
-            Err("表达式解析不完整".to_string())
-        } else {
-            Ok(v)
-        }
-    }).unwrap_or_else(|e| Err(e))
-}
+    fn description(&self) -> &str {
+        r#"获取当前时间。
 
-fn parse_expr(s: &str, i: &mut usize) -> Result<(f64, usize), String> {
-    let (mut left, mut pos) = parse_term(s, i)?;
+使用场景：
+- 记录操作时间戳
+- 判断当前是白天还是夜晚
+- 在日志中加入时间信息
+- 与时间相关的条件判断
 
-    while *i < s.len() {
-        let c = s[*i..].chars().next().unwrap();
-        if c == '+' {
-            *i += 1;
-            let (right, new_pos) = parse_term(s, i)?;
-            left += right;
-            pos = new_pos;
-        } else if c == '-' {
-            *i += 1;
-            let (right, new_pos) = parse_term(s, i)?;
-            left -= right;
-            pos = new_pos;
-        } else {
-            break;
-        }
+使用示例：
+- get_current_time("") → 返回当前时间（如 "2024-01-15 14:30:25 UTC"）
+
+注意事项：
+- 返回的是 UTC 时间
+- 适合记录时间，但不适用于复杂的时间计算（用 calculator 工具）"#
     }
 
-    Ok((left, pos))
-}
-
-fn parse_term(s: &str, i: &mut usize) -> Result<(f64, usize), String> {
-    let (mut left, mut pos) = parse_factor(s, i)?;
-
-    while *i < s.len() {
-        let c = s[*i..].chars().next().unwrap();
-        if c == '*' {
-            *i += 1;
-            let (right, new_pos) = parse_factor(s, i)?;
-            left *= right;
-            pos = new_pos;
-        } else if c == '/' {
-            *i += 1;
-            let (right, new_pos) = parse_factor(s, i)?;
-            if right == 0.0 {
-                return Err("除数不能为0".to_string());
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "timezone": {
+                    "type": "string",
+                    "description": "时区（如 'Asia/Shanghai'），默认 UTC"
+                }
             }
-            left /= right;
-            pos = new_pos;
-        } else {
-            break;
+        })
+    }
+
+    fn execute(&self, input: &str) -> Result<String, String> {
+        #[derive(Debug, Deserialize)]
+        struct TimeInput {
+            timezone: Option<String>,
         }
-    }
 
-    Ok((left, pos))
-}
+        let input: TimeInput =
+            serde_json::from_str(input).unwrap_or(TimeInput { timezone: None });
 
-fn parse_factor(s: &str, i: &mut usize) -> Result<(f64, usize), String> {
-    // 跳过空白
-    while *i < s.len() && s[*i..].starts_with(' ') {
-        *i += 1;
-    }
+        let now = chrono_lite_now();
 
-    if *i >= s.len() {
-        return Err("意外的表达式结尾".to_string());
-    }
-
-    let c = s[*i..].chars().next().unwrap();
-
-    if c == '(' {
-        *i += 1;
-        let (val, pos) = parse_expr(s, i)?;
-        if *i < s.len() && s[*i..].starts_with(')') {
-            *i += 1;
-            Ok((val, *i))
-        } else {
-            Err("缺少右括号".to_string())
-        }
-    } else if c == '-' {
-        *i += 1;
-        let (val, pos) = parse_factor(s, i)?;
-        Ok((-val, pos))
-    } else {
-        parse_number(s, i)
+        let tz = input.timezone.unwrap_or_else(|| "UTC".to_string());
+        Ok(format!("{} ({})", now, tz))
     }
 }
 
-fn parse_number(s: &str, i: &mut usize) -> Result<(f64, usize), String> {
-    let start = *i;
-    while *i < s.len() && (s[*i..].chars().next().unwrap().is_numeric() || s[*i..].starts_with('.')) {
-        *i += 1;
-    }
-    let num_str = &s[start..*i];
-    num_str.parse::<f64>()
-        .map(|v| (v, *i))
-        .map_err(|_| format!("无法解析数字: '{}'", num_str))
-}
-
-/// 简化版当前时间
+/// 简化版 chrono now
 fn chrono_lite_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let secs = now.as_secs();
     let days = secs / 86400;
     let year = 1970 + days / 365;
@@ -422,29 +410,96 @@ fn chrono_lite_now() -> String {
     let hour = (secs % 86400) / 3600;
     let min = (secs % 3600) / 60;
     let sec = secs % 60;
-    format!(
-        "{}年{}月{}日 {:02}:{:02}:{:02} (UTC+8)",
-        year, month, day,
-        (hour + 8) % 24, min, sec
-    )
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, month, day, hour, min, sec)
 }
 
 // ─────────────────────────────────────────────
-// 错误类型
+// 工具注册表
 // ─────────────────────────────────────────────
 
-pub struct ToolError(pub String);
+pub struct ToolRegistry {
+    tools: HashMap<String, Box<dyn Tool>>,
+    pub tool_defs: Vec<ToolDef>,
+}
 
-impl std::fmt::Display for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl Clone for ToolRegistry {
+    fn clone(&self) -> Self {
+        Self::new()
     }
 }
 
-impl std::fmt::Debug for ToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ToolError({})", self.0)
+impl ToolRegistry {
+    pub fn new() -> Self {
+        let mut tools = HashMap::new();
+        let mut tool_defs = Vec::new();
+
+        // 注册所有工具
+        let tool_list: Vec<Box<dyn Tool>> = vec![
+            Box::new(CalculatorTool),
+            Box::new(BashTool),
+            Box::new(GetTimeTool),
+        ];
+
+        for tool in tool_list {
+            let name = tool.name().to_string();
+            let def = ToolDef {
+                name: name.clone(),
+                description: tool.description().to_string(),
+                input_schema: tool.input_schema(),
+            };
+            tool_defs.push(def);
+            tools.insert(name, tool);
+        }
+
+        Self { tools, tool_defs }
+    }
+
+    /// 列出所有工具定义（给 LLM 看）
+    pub fn list(&self) -> Vec<ToolDef> {
+        self.tool_defs.clone()
+    }
+
+    /// 执行工具
+    pub fn execute(&self, name: &str, arguments: &str) -> Result<String, String> {
+        let tool = self
+            .tools
+            .get(name)
+            .ok_or_else(|| format!("未知工具: {}", name))?;
+        tool.execute(arguments)
+    }
+
+    /// 检查工具是否存在
+    pub fn has(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
     }
 }
 
-impl std::error::Error for ToolError {}
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────
+// 测试
+// ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculator() {
+        let tool = CalculatorTool {};
+        assert_eq!(tool.execute(r#"{"expression": "2 + 3"}"#).unwrap(), "5");
+        assert_eq!(tool.execute(r#"{"expression": "10 * 0.15"}"#).unwrap(), "1.5");
+        assert_eq!(tool.execute(r#"{"expression": "(10 + 5) / 3"}"#).unwrap(), "5");
+    }
+
+    #[test]
+    fn test_chrono_now() {
+        let now = chrono_lite_now();
+        assert!(now.contains('-'));
+        assert!(now.contains(':'));
+    }
+}

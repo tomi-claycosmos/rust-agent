@@ -92,6 +92,60 @@ async fn run_interactive_mode() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ─────────────────────────────────────────────
+// 自动路由层 — Anthropic Context Engineering 启发
+// ─────────────────────────────────────────────
+
+/// 根据任务复杂度自动选择 Agent 架构
+///
+/// Anthropic 的经验：
+/// - 简单任务 → 单 Agent（节省 token）
+/// - 复杂任务 → Multi-Agent（分布 token 消耗，换取更高成功率）
+///
+/// 判断依据（基于 Anthropic Multi-Agent Research 的发现）：
+/// - Token 使用量解释 80% 性能方差
+/// - Multi-Agent 比单 Agent Opus 4 强 90.2%
+/// - 适合多方向并行探索的任务
+fn should_use_multi_agent(project_path: &std::path::Path) -> bool {
+    use std::fs;
+
+    let spec_path = project_path.join("SPEC.md");
+    if !spec_path.exists() {
+        return false; // 没有 feature list，默认单 Agent
+    }
+
+    // 读取 feature list 数量
+    let content = fs::read_to_string(&spec_path).unwrap_or_default();
+
+    // 简单估算 feature 数量
+    let feature_count = content.matches("\"passes\"").count();
+
+    // 启发式规则：
+    // - Feature 数量 > 5 → 多 Agent
+    // - 项目已有较大 feature list → 多 Agent
+    // - 用户显式指定 --multi-agent → 多 Agent（在调用处处理）
+    feature_count > 5 || content.len() > 5000
+}
+
+/// 根据 Feature 类型判断是否需要 Extended Thinking
+///
+/// Anthropic 发现：Extended Thinking 适合：
+/// - 需要规划的任务（multi-step reasoning）
+/// - 需要评估和反思的任务
+/// - 复杂的开放式问题
+///
+/// 不适合：简单的事实查询、快速操作
+fn should_use_extended_thinking(feature_category: &str) -> bool {
+    let complex_keywords = [
+        "integration", "api", "data", "storage",
+        "error", "boundary", "auth", "security",
+        "algorithm", "optimization", "refactor",
+    ];
+    complex_keywords
+        .iter()
+        .any(|kw| feature_category.to_lowercase().contains(kw))
+}
+
+// ─────────────────────────────────────────────
 // 双 Agent 模式（Anthropic 长运行架构）
 // ─────────────────────────────────────────────
 
@@ -182,11 +236,21 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
             let project_path = project_path.ok_or("缺少 --project 参数")?;
             let project_str = project_path.to_string_lossy().to_string();
 
+            // ── 自动路由 ──
+            // 如果用户没有显式指定，则根据任务复杂度自动选择
+            let auto_multi = !multi_agent && should_use_multi_agent(&project_path);
+
             if multi_agent {
                 println!("{}", "\n🔧 双 Agent 模式: Coding Agent (多 Agent)".cyan());
                 println!("  模式: Orchestrator → Coder + Tester + Reviewer");
+                println!("  (用户显式指定)");
+            } else if auto_multi {
+                println!("{}", "\n🔧 双 Agent 模式: Coding Agent (多 Agent)".cyan());
+                println!("  模式: Orchestrator → Coder + Tester + Reviewer");
+                println!("  🧠 自动路由：根据 feature 数量/项目规模判断");
             } else {
                 println!("{}", "\n🔧 双 Agent 模式: Coding Agent (单 Agent)".cyan());
+                println!("  🧠 自动路由：任务规模较小，使用单 Agent 节省 token");
             }
             println!("  项目: {:?}", project_path);
 
@@ -204,7 +268,7 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
                     &project_str,
                 );
 
-                let result = if multi_agent {
+                let result = if multi_agent || auto_multi {
                     coding_agent.run_multi_agent().await
                 } else {
                     coding_agent.run().await
@@ -227,7 +291,7 @@ async fn run_dual_agent_mode(args: &[String]) -> Result<(), Box<dyn std::error::
 
             if completed > 0 {
                 println!("\n📊 本轮完成 {} 个 features（模式: {}）。", completed,
-                    if multi_agent { "多 Agent" } else { "单 Agent" });
+                    if multi_agent || auto_multi { "多 Agent（自动路由）" } else { "单 Agent" });
                 println!("💡 再次运行 `cargo run -- continue --project {:?}` 继续。", project_path);
             }
         }

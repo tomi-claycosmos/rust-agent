@@ -11,8 +11,8 @@
 // 用户需求 → Initializer Agent → 项目脚手架 → Coding Agent（循环）→ 最终交付
 // ```
 
-use crate::llm::{LlmClient, LlmResponse, LlmMessage};
-use crate::project::{Feature, FeatureList};
+use crate::llm::{LlmClient, LlmResponse};
+use crate::project::FeatureList;
 use crate::tools::ToolRegistry;
 use crate::memory::ConversationMemory;
 use std::fs;
