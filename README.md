@@ -129,6 +129,49 @@ rust-agent/
 └── README.md
 ```
 
+## 多 Agent 架构
+
+### 单 Agent vs 多 Agent
+
+rust-agent 支持两种 Coding Agent 模式：
+
+**单 Agent 模式（默认）**：一个 Agent 完成所有工作，简单高效。
+
+**多 Agent 模式（`--multi-agent`）**：
+```
+                    ┌─────────────────┐
+                    │  Orchestrator   │  ← 分析 feature，决定谁来做什么
+                    │  (协调者)        │
+                    └──────┬──────────┘
+                           │ 分配任务
+           ┌───────────────┼───────────────┐
+           ▼               ▼               ▼
+    ┌──────────┐   ┌──────────┐   ┌──────────┐
+    │  Coder   │   │  Tester  │   │ Reviewer │
+    │ (写代码) │   │ (写测试) │   │ (审查)   │
+    └─────┬────┘   └─────┬────┘   └─────┬────┘
+          │              │              │
+          └──────────────┬┴──────────────┘
+                         │
+                   ┌─────▼─────┐
+                   │ Shared    │  ← SPEC.md + Progress + Git
+                   │ State     │    所有 Agent 读写同一套文件
+                   └───────────┘
+```
+
+Orchestrator 根据 Feature 类型自动选择参与 Agent：
+- UI/前端 → Coder + Tester
+- 数据/存储 → Coder + Reviewer + Tester
+- API/集成 → 三者全部参与
+- 默认 → Coder + Tester + Reviewer
+
+```bash
+# 使用多 Agent 模式
+cargo run -- continue --project ./my-todo --multi-agent
+```
+
+---
+
 ## 🧪 扩展练习
 
 ### 1. 添加持久化记忆
